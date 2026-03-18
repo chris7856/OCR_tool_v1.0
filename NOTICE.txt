@@ -1,0 +1,20 @@
+PADDLEOCR-VL-1.5-EXE
+
+版权所有 2026 [武靖]
+
+本仓库中的原创源代码采用 Apache License 2.0 许可证。
+
+本仓库也包含第三方材料，包括 model_file/ 目录下的模型文件。
+此类第三方材料的版权和许可证仍归其各自权利人所有。
+
+若第三方材料附带原始 LICENSE、NOTICE、README 或其他署名/声明文件，
+本仓库会在相应目录中按原样保留。
+
+Copyright 2026 [jing Wu]
+
+This repository contains original source code licensed under the Apache License 2.0.
+
+This repository also includes third-party materials, including model files under the model_file/ directory.
+Such third-party materials remain under their respective copyright and license terms.
+
+The original LICENSE, NOTICE, README, and other attribution files provided with third-party materials are preserved in their respective directories where applicable.

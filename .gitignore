@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Editor settings
+.vscode/
+.idea/
+
+# Runtime cache
+cache/
+
+# Program output
+output/
+
+# Model files
+model_file/
+
+# Log files
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

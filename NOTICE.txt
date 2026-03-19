@@ -10,7 +10,7 @@ PADDLEOCR-VL-1.5-EXE
 若第三方材料附带原始 LICENSE、NOTICE、README 或其他署名/声明文件，
 本仓库会在相应目录中按原样保留。
 
-Copyright 2026 [jing Wu]
+Copyright 2026 [Jing Wu]
 
 This repository contains original source code licensed under the Apache License 2.0.
 

@@ -20,10 +20,7 @@ from PyInstaller.utils.hooks import copy_metadata, collect_submodules
 def find_site_packages():
     """
     自动寻找当前 Python 环境的 site-packages 目录。
-    优先级：
-    1. site.getsitepackages()
-    2. sysconfig.get_paths()
-    3. 根据 sys.prefix / sys.exec_prefix 拼接常见路径
+    优先返回真正的 site-packages / dist-packages 路径。
     """
     candidates = []
 
@@ -31,7 +28,7 @@ def find_site_packages():
     try:
         for p in site.getsitepackages():
             if p and os.path.isdir(p):
-                candidates.append(p)
+                candidates.append(os.path.abspath(p))
     except Exception:
         pass
 
@@ -41,37 +38,46 @@ def find_site_packages():
         for key in ("purelib", "platlib"):
             p = paths.get(key)
             if p and os.path.isdir(p):
-                candidates.append(p)
+                candidates.append(os.path.abspath(p))
     except Exception:
         pass
 
-    # 方式3：基于当前 Python/conda 环境路径拼接
-    # Windows 常见路径：<env>\Lib\site-packages
-    # Linux/macOS 常见路径：<env>/lib/pythonX.Y/site-packages
+    # 方式3：基于环境路径拼接常见目录
     version_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    prefix_list = [sys.prefix, sys.exec_prefix]
-
-    for prefix in prefix_list:
+    for prefix in [sys.prefix, sys.exec_prefix]:
         if not prefix:
             continue
 
-        win_path = os.path.join(prefix, "Lib", "site-packages")
-        unix_path = os.path.join(prefix, "lib", version_tag, "site-packages")
+        for p in [
+            os.path.join(prefix, "Lib", "site-packages"),                 # Windows
+            os.path.join(prefix, "lib", version_tag, "site-packages"),    # Linux/macOS
+            os.path.join(prefix, "lib", "site-packages"),                 # 某些环境
+        ]:
+            if os.path.isdir(p):
+                candidates.append(os.path.abspath(p))
 
-        if os.path.isdir(win_path):
-            candidates.append(win_path)
-        if os.path.isdir(unix_path):
-            candidates.append(unix_path)
-
-    # 去重后返回第一个存在的目录
+    # 去重
+    uniq = []
     seen = set()
     for p in candidates:
-        p = os.path.abspath(p)
-        if p not in seen and os.path.isdir(p):
+        if p not in seen:
             seen.add(p)
+            uniq.append(p)
+
+    # 优先选择真正的 site-packages / dist-packages
+    for p in uniq:
+        low = p.lower().replace("/", "\\")
+        if low.endswith("\\site-packages") or low.endswith("\\dist-packages"):
             return p
 
-    raise RuntimeError("未能自动找到当前环境的 site-packages 目录，请检查 Python/conda 环境。")
+    # 兜底：找包含 paddle 的目录
+    for p in uniq:
+        if os.path.isdir(os.path.join(p, "paddle")):
+            return p
+
+    raise RuntimeError(
+        f"未能自动找到当前环境的 site-packages 目录。候选路径: {uniq}"
+    )
 
 
 # 当前环境的 site-packages 根目录

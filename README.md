@@ -59,8 +59,8 @@ OCR_tool_v1.0/
 
 - 将项目克隆或下载到本地：
 ```bash
-git clone <your-repository-url>
-cd PADDLEOCR-VL-1.5-EXE
+git clone https://github.com/chris7856/OCR_tool_v1.0.git
+cd OCR_tool_v1.0
 ```
 
 若你当前并未使用 Git，也可以直接下载仓库压缩包并解压到本地。
@@ -76,9 +76,9 @@ https://huggingface.co/PaddlePaddle/PP-DocLayoutV3/tree/main
 在控制台逐个执行以下命令以安装依赖项
 ```bash
 pip install paddlepaddle==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-pip install "paddleocr[doc-parser]"
-pip install PySide6
-pip install pyinstaller
+pip install "paddleocr[doc-parser]==3.4.0"
+pip install PySide6==6.10.2
+pip install pyinstaller==6.19.0
 ```
 
 ### 6.3启动程序

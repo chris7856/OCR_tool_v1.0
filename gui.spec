@@ -1,30 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-# PyInstaller 打包配置文件
-# 作用：
-# 1. 指定 GUI 主入口 app_gui.py
-# 2. 收集 PaddleOCR / PaddleX / PaddlePaddle / OpenCV 等依赖
-# 3. 收集模型目录、测试目录、输出目录等项目资源
-# 4. 收集 Excel 导出相关依赖（openpyxl / beautifulsoup4 / et_xmlfile）
-# 5. 自动适配当前 Python/conda 环境中的 site-packages 路径，避免写死环境路径
-
 import os
 import sys
 import site
 import sysconfig
-from PyInstaller.utils.hooks import copy_metadata, collect_submodules
+from pathlib import Path
+
+from PyInstaller.utils.hooks import (
+    copy_metadata,
+    collect_submodules,
+    collect_data_files,
+    collect_dynamic_libs,
+)
+
+block_cipher = None
 
 
 # ================= 自动获取当前环境的 site-packages 路径 =================
-# 自动查找当前解释器对应的 site-packages 路径。
+# 目的：
+# 1. 尽量自动适配不同机器/环境，避免把 site-packages 路径写死
+# 2. 后面需要从这里定位 paddle/cv2/pypdfium2_raw 等包的文件
 def find_site_packages():
-    """
-    自动寻找当前 Python 环境的 site-packages 目录。
-    优先返回真正的 site-packages / dist-packages 路径。
-    """
     candidates = []
 
-    # 方式1：标准 site 接口
+    # 方式1：通过标准库 site 获取
     try:
         for p in site.getsitepackages():
             if p and os.path.isdir(p):
@@ -32,7 +31,7 @@ def find_site_packages():
     except Exception:
         pass
 
-    # 方式2：sysconfig
+    # 方式2：通过 sysconfig 获取 purelib / platlib
     try:
         paths = sysconfig.get_paths()
         for key in ("purelib", "platlib"):
@@ -42,16 +41,16 @@ def find_site_packages():
     except Exception:
         pass
 
-    # 方式3：基于环境路径拼接常见目录
+    # 方式3：根据当前 Python/conda 环境的前缀路径拼接常见目录
     version_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
     for prefix in [sys.prefix, sys.exec_prefix]:
         if not prefix:
             continue
 
         for p in [
-            os.path.join(prefix, "Lib", "site-packages"),                 # Windows
-            os.path.join(prefix, "lib", version_tag, "site-packages"),    # Linux/macOS
-            os.path.join(prefix, "lib", "site-packages"),                 # 某些环境
+            os.path.join(prefix, "Lib", "site-packages"),               # Windows
+            os.path.join(prefix, "lib", version_tag, "site-packages"),  # Linux/macOS
+            os.path.join(prefix, "lib", "site-packages"),
         ]:
             if os.path.isdir(p):
                 candidates.append(os.path.abspath(p))
@@ -64,116 +63,287 @@ def find_site_packages():
             seen.add(p)
             uniq.append(p)
 
-    # 优先选择真正的 site-packages / dist-packages
+    # 优先返回真正的 site-packages / dist-packages
     for p in uniq:
         low = p.lower().replace("/", "\\")
         if low.endswith("\\site-packages") or low.endswith("\\dist-packages"):
             return p
 
-    # 兜底：找包含 paddle 的目录
+    # 兜底：如果目录里含有 paddle，也认为它是目标 site-packages
     for p in uniq:
         if os.path.isdir(os.path.join(p, "paddle")):
             return p
 
-    raise RuntimeError(
-        f"未能自动找到当前环境的 site-packages 目录。候选路径: {uniq}"
+    raise RuntimeError(f"未能自动找到当前环境的 site-packages 目录。候选路径: {uniq}")
+
+
+SITE = find_site_packages()
+
+# 常用第三方库目录
+PADDLE_LIBS = os.path.join(SITE, "paddle", "libs")
+PADDLE_BASE = os.path.join(SITE, "paddle", "base")
+CV2_DIR = os.path.join(SITE, "cv2")
+PYPDFIUM_RAW = os.path.join(SITE, "pypdfium2_raw")
+
+
+# ================= 辅助函数：显式收集 .dist-info =================
+# 目的：
+# 某些库（如 paddlex）会通过 importlib.metadata 检查依赖/extra 信息。
+# 在 PyInstaller 打包环境中，如果缺少 dist-info，可能会误判“依赖未安装”。
+# 所以这里主动把关键包的 .dist-info 一并打包进去。
+def collect_dist_info_dirs(pkg_names):
+    datas = []
+    roots = []
+
+    try:
+        for p in site.getsitepackages():
+            if p and os.path.isdir(p):
+                roots.append(Path(p))
+    except Exception:
+        pass
+
+    try:
+        p = site.getusersitepackages()
+        if p and os.path.isdir(p):
+            roots.append(Path(p))
+    except Exception:
+        pass
+
+    try:
+        paths = sysconfig.get_paths()
+        for key in ("purelib", "platlib"):
+            p = paths.get(key)
+            if p and os.path.isdir(p):
+                roots.append(Path(p))
+    except Exception:
+        pass
+
+    # roots 去重
+    uniq_roots = []
+    seen_roots = set()
+    for r in roots:
+        try:
+            rr = str(r.resolve())
+        except Exception:
+            rr = str(r)
+        if rr not in seen_roots:
+            seen_roots.add(rr)
+            uniq_roots.append(r)
+
+    # 扫描目标包对应的 .dist-info 目录
+    seen = set()
+    for root in uniq_roots:
+        for pkg in pkg_names:
+            patterns = [
+                f"{pkg}-*.dist-info",
+                f"{pkg.replace('-', '_')}-*.dist-info",
+                f"{pkg.replace('_', '-')}-*.dist-info",
+            ]
+            for pat in patterns:
+                for dist in root.glob(pat):
+                    if dist.is_dir():
+                        try:
+                            key = str(dist.resolve())
+                        except Exception:
+                            key = str(dist)
+                        if key not in seen:
+                            seen.add(key)
+                            # 目标路径写 "."，在 one-folder 下通常会被整理到运行目录/_internal
+                            datas.append((str(dist), "."))
+
+    return datas
+
+
+# ================= 在 spec 内自动生成 runtime hook =================
+# 目的：
+# 1. 启动 exe 时，把 _internal 加进 sys.path，方便 importlib.metadata 找到 dist-info
+# 2. 对 paddlex 的 OCR extra 检查做运行时补丁，避免 frozen 环境误判依赖缺失
+RUNTIME_HOOK = "rthook_add_internal_path_and_patch_paddlex.py"
+with open(RUNTIME_HOOK, "w", encoding="utf-8") as f:
+    f.write(
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "# 1) 把 _internal 加入 sys.path，提升 frozen 环境下 metadata 查找成功率\n"
+        "if getattr(sys, 'frozen', False):\n"
+        "    exe_dir = os.path.dirname(sys.executable)\n"
+        "    internal_dir = os.path.join(exe_dir, '_internal')\n"
+        "    if os.path.isdir(internal_dir) and internal_dir not in sys.path:\n"
+        "        sys.path.insert(0, internal_dir)\n"
+        "\n"
+        "# 2) 对 paddlex 的 OCR extra 检查做兼容补丁\n"
+        "#    原因：exe 环境里即使依赖已打包，paddlex 仍可能误判 ocr extra 不可用\n"
+        "try:\n"
+        "    import paddlex.utils.deps as _deps\n"
+        "\n"
+        "    _orig_require_extra = _deps.require_extra\n"
+        "    _orig_is_extra_available = _deps.is_extra_available\n"
+        "\n"
+        "    def _patched_is_extra_available(extra):\n"
+        "        if extra == 'ocr':\n"
+        "            try:\n"
+        "                import importlib.util as _u\n"
+        "                needed = [\n"
+        "                    'paddle',\n"
+        "                    'paddleocr',\n"
+        "                    'tokenizers',\n"
+        "                    'sentencepiece',\n"
+        "                    'safetensors',\n"
+        "                    'pypdfium2',\n"
+        "                ]\n"
+        "                if all(_u.find_spec(x) is not None for x in needed):\n"
+        "                    return True\n"
+        "            except Exception:\n"
+        "                return True\n"
+        "            return True\n"
+        "        return _orig_is_extra_available(extra)\n"
+        "\n"
+        "    def _patched_require_extra(extra, obj_name=None, alt=None):\n"
+        "        if extra == 'ocr':\n"
+        "            return\n"
+        "        return _orig_require_extra(extra, obj_name=obj_name, alt=alt)\n"
+        "\n"
+        "    _deps.is_extra_available = _patched_is_extra_available\n"
+        "    _deps.require_extra = _patched_require_extra\n"
+        "\n"
+        "except Exception:\n"
+        "    pass\n"
     )
 
 
-# 当前环境的 site-packages 根目录
-SITE = find_site_packages()
-
-# Paddle 动态库目录
-PADDLE_LIBS = os.path.join(SITE, "paddle", "libs")
-
-# Paddle base 目录，libpaddle.pyd 在这里
-PADDLE_BASE = os.path.join(SITE, "paddle", "base")
-
-# OpenCV 安装目录
-CV2_DIR = os.path.join(SITE, "cv2")
-
-# pypdfium2 的底层原生 DLL 所在目录
-PYPDFIUM_RAW = os.path.join(SITE, "pypdfium2_raw")
-
-# 新版 PyInstaller 中通常保持 None 
-block_cipher = None
-
-
-# ================= metadata 复制 =================
-# 复制安装包的 dist-info / 元数据
-# 某些库在运行时会通过 importlib.metadata 读取版本信息，
-# 若 metadata 丢失，打包后可能报错
+# ================= datas：非 .py 资源文件 =================
 datas = []
-for pkg in [
-    "paddleocr", "paddlepaddle", "paddlex", "numpy",
-    "safetensors", "sentencepiece", "Jinja2",
-    "opencv-contrib-python", "pypdfium2", "tokenizers",
-    "huggingface_hub", "packaging", "filelock", "regex", "tqdm",
-    "openpyxl", "beautifulsoup4", "et_xmlfile",
-]:
+
+# ---- 复制关键包的 metadata ----
+# copy_metadata 会把包的元信息带进去，供 importlib.metadata 等机制使用
+meta_pkgs = [
+    "paddleocr",
+    "paddlepaddle",
+    "paddlex",
+    "numpy",
+    "safetensors",
+    "sentencepiece",
+    "Jinja2",
+    "MarkupSafe",
+    "opencv-contrib-python",
+    "pypdfium2",
+    "tokenizers",
+    "huggingface_hub",
+    "packaging",
+    "filelock",
+    "regex",
+    "tqdm",
+    "openpyxl",
+    "beautifulsoup4",
+    "et_xmlfile",
+]
+
+for pkg in meta_pkgs:
     try:
         datas += copy_metadata(pkg)
     except Exception:
-        # 个别包可能没有 metadata，忽略
         pass
 
+# 某些环境里会有 lazy_paddle，存在的话也一起带上
+try:
+    datas += copy_metadata("lazy_paddle")
+except Exception:
+    pass
 
-# ================= 项目资源 =================
-# 收集项目目录下需要一起发布的资源文件夹
-# 打包后会复制到 dist 输出目录中
+# ---- 显式补充 dist-info 目录 ----
+# 这是对 copy_metadata 的补强，尽量避免 frozen 环境下 metadata 丢失
+datas += collect_dist_info_dirs([
+    "paddlex",
+    "paddleocr",
+    "paddlepaddle",
+    "numpy",
+    "safetensors",
+    "sentencepiece",
+    "tokenizers",
+    "pypdfium2",
+    "packaging",
+    "filelock",
+    "regex",
+    "tqdm",
+    "openpyxl",
+    "beautifulsoup4",
+    "et_xmlfile",
+    "Jinja2",
+    "MarkupSafe",
+    "huggingface_hub",
+])
+
+# ---- 收集包内资源文件 ----
+# 例如配置文件、模板、字典、模型说明等非 Python 文件
+for pkg in [
+    "paddle",
+    "paddleocr",
+    "paddlex",
+    "cv2",
+    "pypdfium2",
+    "pypdfium2_raw",
+    "sentencepiece",
+    "tokenizers",
+    "jinja2",
+    "markupsafe",
+    "openpyxl",
+    "bs4",
+    "shapely",
+]:
+    try:
+        datas += collect_data_files(pkg)
+    except Exception:
+        pass
+
+# ---- 项目自身资源目录 ----
+# 如果这些目录存在，也一起打进产物中
 for name in ["model_file", "test_img", "output"]:
     p = os.path.join(".", name)
     if os.path.exists(p):
         datas.append((p, name))
 
-
-# ================= 原有依赖目录 =================
-# 手工补充一些重要依赖目录/文件
-# 原因：
-# 某些库存在动态导入、内部资源查找、运行时配置读取等行为，
-# PyInstaller 自动分析不一定能完整收集到
-datas += [
-    # PaddleX / PaddleOCR 包目录
-    (os.path.join(SITE, "paddlex"), "paddlex"),
-    (os.path.join(SITE, "paddleocr"), "paddleocr"),
-
-    # OpenCV 配置文件
-    (os.path.join(CV2_DIR, "__init__.py"), "cv2"),
-    (os.path.join(CV2_DIR, "config.py"), "cv2"),
-    (os.path.join(CV2_DIR, "config-3.py"), "cv2"),
-    (os.path.join(CV2_DIR, "load_config_py3.py"), "cv2"),
-
-    # 其它常见依赖目录
-    (os.path.join(SITE, "shapely"), "shapely"),
-    (os.path.join(SITE, "pypdfium2"), "pypdfium2"),
-    (os.path.join(SITE, "pypdfium2_raw"), "pypdfium2_raw"),
-    (os.path.join(SITE, "sentencepiece"), "sentencepiece"),
-    (os.path.join(SITE, "tokenizers"), "tokenizers"),
-    (os.path.join(SITE, "jinja2"), "jinja2"),
-    (os.path.join(SITE, "markupsafe"), "markupsafe"),
-]
+# datas 去重，避免重复打包同一路径
+_unique_datas = []
+_seen_data = set()
+for item in datas:
+    key = (os.path.normpath(item[0]), item[1])
+    if key not in _seen_data:
+        _seen_data.add(key)
+        _unique_datas.append(item)
+datas = _unique_datas
 
 
-# ================= hiddenimports =================
-# 显式声明隐藏导入模块
-# 对大量动态导入的库非常重要，能减少打包后运行时报错：
-# “No module named xxx”
+# ================= hiddenimports：隐藏导入模块 =================
+# 这些模块可能通过动态导入方式加载，PyInstaller 静态分析不一定能发现，
+# 所以需要手工声明。
 hiddenimports = [
-    # 主程序/子进程入口
+    # 主程序 / 子进程入口
     "cpu_infer",
 
-    # PySide6 图形界面模块
-    "PySide6", "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets",
+    # GUI
+    "PySide6",
+    "PySide6.QtCore",
+    "PySide6.QtGui",
+    "PySide6.QtWidgets",
 
-    # paddle 主体模块
-    "paddle", "paddle.base", "paddle.base.core", "paddle.fluid",
-    "paddle.utils", "paddle.nn", "paddle.nn.functional",
-    "paddle.optimizer", "paddle.io", "paddle.vision", "paddle.vision.transforms",
+    # paddle 主体
+    "paddle",
+    "paddle.base",
+    "paddle.base.core",
+    "paddle.fluid",
+    "paddle.utils",
+    "paddle.nn",
+    "paddle.nn.functional",
+    "paddle.optimizer",
+    "paddle.io",
+    "paddle.vision",
+    "paddle.vision.transforms",
 
     # paddleocr
-    "paddleocr", "paddleocr.paddleocr",
+    "paddleocr",
+    "paddleocr.paddleocr",
 
-    # paddlex 相关
+    # paddlex
     "paddlex",
     "paddlex.inference",
     "paddlex.inference.pipelines",
@@ -183,27 +353,40 @@ hiddenimports = [
     "paddlex.inference.components",
     "paddlex.repo_apis",
     "paddlex.utils",
+    "paddlex.utils.deps",
 
     # cv2 / numpy
-    "cv2", "numpy",
+    "cv2",
+    "numpy",
 
-    # PIL 图像处理
-    "PIL", "PIL.Image", "PIL.ImageDraw", "PIL.ImageFont",
+    # PIL
+    "PIL",
+    "PIL.Image",
+    "PIL.ImageDraw",
+    "PIL.ImageFont",
 
     # tokenizer / transformer 相关
-    "tokenizers", "sentencepiece", "huggingface_hub", "safetensors",
+    "tokenizers",
+    "sentencepiece",
+    "huggingface_hub",
+    "safetensors",
 
-    # 科学计算相关
-    "einops", "scipy", "scipy.special", "scipy.ndimage",
+    # 科学计算
+    "einops",
+    "scipy",
+    "scipy.special",
+    "scipy.ndimage",
 
     # sklearn
-    "sklearn", "sklearn.utils", "joblib",
+    "sklearn",
+    "sklearn.utils",
+    "joblib",
 
     # shapely
-    "shapely", "shapely.geometry",
+    "shapely",
+    "shapely.geometry",
 
-    # Excel / HTML 解析
-    # 对应 cpu_infer.py 中的 Excel 导出功能
+    # Excel / HTML
     "openpyxl",
     "openpyxl.workbook",
     "openpyxl.worksheet",
@@ -215,44 +398,79 @@ hiddenimports = [
     "bs4",
     "bs4.builder",
 
-    # 其它通用依赖
-    "pyclipper", "lxml", "lxml.etree", "openpyxl",
-    "pypdfium2", "pypdfium2_raw", "yaml", "pyyaml", "tqdm", "regex",
-    "filelock", "packaging", "importlib_metadata", "importlib.metadata",
-    "ruamel.yaml", "ruamel.yaml.comments", "colorlog", "prettytable",
-    "ujson", "psutil", "jinja2", "jinja2.sandbox", "jinja2.environment",
-    "jinja2.runtime", "jinja2.utils", "jinja2.filters", "jinja2.tests",
-    "jinja2.lexer", "jinja2.parser", "jinja2.compiler", "jinja2.optimizer",
-    "jinja2.ext", "jinja2.defaults", "jinja2.exceptions",
-    "jinja2.loaders", "markupsafe",
+    # 通用依赖
+    "pyclipper",
+    "lxml",
+    "lxml.etree",
+    "pypdfium2",
+    "pypdfium2_raw",
+    "yaml",
+    "pyyaml",
+    "tqdm",
+    "regex",
+    "filelock",
+    "packaging",
+    "importlib_metadata",
+    "importlib.metadata",
+    "ruamel.yaml",
+    "ruamel.yaml.comments",
+    "colorlog",
+    "prettytable",
+    "ujson",
+    "psutil",
+    "jinja2",
+    "jinja2.sandbox",
+    "jinja2.environment",
+    "jinja2.runtime",
+    "jinja2.utils",
+    "jinja2.filters",
+    "jinja2.tests",
+    "jinja2.lexer",
+    "jinja2.parser",
+    "jinja2.compiler",
+    "jinja2.optimizer",
+    "jinja2.ext",
+    "jinja2.defaults",
+    "jinja2.exceptions",
+    "jinja2.loaders",
+    "markupsafe",
 ]
 
-
-# ================= 自动补动态子模块 =================
-# 对部分复杂库递归收集所有子模块，
-# 进一步降低“打包后缺模块”的概率
+# 自动递归收集常见动态导入模块，减少漏包风险
 for pkg in [
-    "PySide6", "paddleocr", "paddlex", "safetensors",
-    "jinja2", "sentencepiece", "tokenizers", "pypdfium2", "shapely",
-    "openpyxl", "bs4",
+    "PySide6",
+    "paddle",
+    "paddleocr",
+    "paddlex",
+    "safetensors",
+    "jinja2",
+    "sentencepiece",
+    "tokenizers",
+    "pypdfium2",
+    "pypdfium2_raw",
+    "shapely",
+    "openpyxl",
+    "bs4",
 ]:
     try:
         hiddenimports += collect_submodules(pkg)
     except Exception:
         pass
 
-# 去重并排序
+# 去重
 hiddenimports = sorted(set(hiddenimports))
 
 
-# ================= binaries =================
-# 手工收集运行时必须的原生二进制文件（.pyd / .dll）
-# 对 Paddle / OpenCV / PDF 渲染功能尤其关键
-binaries = [
-    # Paddle 核心 pyd
+# ================= binaries：原生库 / DLL / pyd =================
+binaries = []
+
+# 手工补充关键二进制文件
+# 原因：这类文件经常是运行时真正会报错的点，显式带上更稳
+manual_binaries = [
+    # Paddle 核心
     (os.path.join(PADDLE_BASE, "libpaddle.pyd"), "paddle/base"),
 
-    # Paddle 运行依赖 dll
+    # Paddle 依赖 DLL
     (os.path.join(PADDLE_LIBS, "common.dll"), "paddle/libs"),
     (os.path.join(PADDLE_LIBS, "libblas.dll"), "paddle/libs"),
     (os.path.join(PADDLE_LIBS, "libgcc_s_seh-1.dll"), "paddle/libs"),
@@ -266,55 +484,69 @@ binaries = [
     (os.path.join(PADDLE_LIBS, "warpctc.dll"), "paddle/libs"),
     (os.path.join(PADDLE_LIBS, "warprnnt.dll"), "paddle/libs"),
 
-    # OpenCV 核心文件
+    # OpenCV
     (os.path.join(CV2_DIR, "cv2.pyd"), "cv2"),
     (os.path.join(CV2_DIR, "opencv_videoio_ffmpeg4100_64.dll"), "cv2"),
 
-    # PDF 渲染依赖
+    # PDFium
     (os.path.join(PYPDFIUM_RAW, "pdfium.dll"), "pypdfium2_raw"),
 ]
 
+for src, dst in manual_binaries:
+    if os.path.exists(src):
+        binaries.append((src, dst))
 
-# ================= Analysis =================
-# 分析主程序及所有依赖
-# app_gui.py 是 GUI 主入口
+# 再自动补一层动态库，提升兼容性
+for pkg in ["paddle", "cv2", "pypdfium2_raw"]:
+    try:
+        binaries += collect_dynamic_libs(pkg)
+    except Exception:
+        pass
+
+# binaries 去重
+_unique_binaries = []
+_seen_bin = set()
+for item in binaries:
+    key = (os.path.normpath(item[0]), item[1])
+    if key not in _seen_bin:
+        _seen_bin.add(key)
+        _unique_binaries.append(item)
+binaries = _unique_binaries
+
+
+# ================= Analysis：分析入口脚本及依赖 =================
 a = Analysis(
-    ["app_gui.py"],             # 主入口脚本
-    pathex=["."],               # 模块搜索路径，"." 表示当前项目目录
-    binaries=binaries,          # 二进制依赖
-    datas=datas,                # 资源文件/数据文件
-    hiddenimports=hiddenimports,# 隐藏导入模块
+    ["app_gui.py"],           # 程序入口文件
+    pathex=["."],             # 当前项目目录加入搜索路径
+    binaries=binaries,        # 原生库 / DLL
+    datas=datas,              # 数据文件 / metadata / 资源文件
+    hiddenimports=hiddenimports,  # 隐藏导入模块
     hookspath=[],
-    runtime_hooks=[],
+    runtime_hooks=[RUNTIME_HOOK],  # 启动时执行的 hook
     excludes=[],
     cipher=block_cipher,
+    noarchive=False,
 )
 
-
-# 将纯 Python 模块打包成归档
+# 打包 Python 字节码
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-
-# ================= EXE =================
-# 生成主 exe
+# 生成 exe
 exe = EXE(
     pyz,
     a.scripts,
     [],
-    exclude_binaries=True,      # 二进制文件延后由 COLLECT 收集
-    name="OCR_tool_v1.0",    # 生成的 exe 名称
+    exclude_binaries=True,
+    name="OCR_tool_v1.0",     # 生成的 exe 名称
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,                  # 通常建议先关闭 upx，避免某些 dll 被压缩后异常
-    console=False,              # False 表示 GUI 程序，不弹控制台黑框
-    icon="app.ico",             # 程序图标
+    upx=False,
+    console=False,            # False 表示窗口程序；调试时可改成 True 看控制台输出
+    icon="app.ico",
 )
 
-
-# ================= COLLECT =================
-# 收集 exe、dll、资源文件、数据文件到 dist 目录
-# 最终通常分发整个 dist/OCR_tool_v1.0 文件夹
+# 收集所有文件到最终发布目录
 coll = COLLECT(
     exe,
     a.binaries,
@@ -322,5 +554,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="OCR_tool_v1.0",
+    name="OCR_tool_v1.0",     # dist 下生成的目录名
 )
